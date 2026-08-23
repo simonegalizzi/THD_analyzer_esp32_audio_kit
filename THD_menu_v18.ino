@@ -1,12 +1,13 @@
 /*******************************************************
   THD+N ANALYZER v18 - ESP32 Audio Kit V2.2 (ES8388) @ 96kHz
+  core esp32 2.0.10
   Refactor modulare della v17: stessa logica di analisi,
   suddivisa in classi (THDAnalyzer, ES8388Helper, UIManager)
   per rendere lo sketch principale leggibile.
 
   LIBRERIE RICHIESTE (Arduino IDE > Library Manager):
-  - "arduino-audio-tools" di pschatzmann
-  - "arduino-audio-driver" di pschatzmann
+  - "arduino-audio-tools" di pschatzmann version 1.2.5 
+  - "arduino-audio-driver" di pschatzmann version 0.2.2
   - "LiquidCrystal I2C" di Frank de Brabander
 
   FILE DI QUESTO SKETCH (tutti nella stessa cartella):
