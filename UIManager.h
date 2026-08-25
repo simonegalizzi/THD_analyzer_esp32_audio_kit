@@ -12,37 +12,46 @@
 class UIManager {
   public:
     UIManager(uint8_t lcdAddr, uint8_t sdaPin, uint8_t sclPin,
-               uint8_t pinStart, uint8_t pinReset, uint8_t pinKey3);
+               uint8_t pinStart, uint8_t pinReset);
 
     void begin();
 
     // Da chiamare ad ogni ciclo di loop() per la lettura media di sessione
     void updateLcd(float thd_percent, float thdn_percent, float last_signal, bool stopped);
 
-    // Menu bloccanti - ritornano solo all'uscita (combo pulsanti / KEY3)
-    // gainRegOut: valore del registro PGA scelto, da scrivere via ES8388Helper
-    // dopo il riavvio (la scrittura I2C al codec e' affidabile solo appena
-    // dopo kit.begin(), mai a runtime - percio' si riavvia la scheda).
-    void enterGainMenu(uint8_t &gainRegInOut);
+    // Display speciale (combo RESET+START tenuta 4s): riga0 = THD live,
+    // riga1 = sequenza fissa "4  8  17  33  83" (16 caratteri esatti,
+    // '4' in colonna 0, ultimo '3' di 83 in colonna 15).
+    void showSpecialDisplay(float thd_percent, bool stopped);
 
-    // noiseHzInOut: soglia esclusione rumore, si applica subito senza riavvio
-    void enterNoiseMenu(float &noiseHzInOut);
+    // Menu unificato impostazioni (GAIN / NOISE / AVG), navigabile con
+    // solo due pulsanti - sostituisce i vecchi menu separati e KEY3.
+    // Bloccante: ritorna solo all'uscita (tenuta combo ~1.5s).
+    // gainRegInOut viene aggiornato E salvato SOLO se il parametro GAIN
+    // e' stato effettivamente toccato durante la sessione di menu (in tal
+    // caso la funzione riavvia la scheda prima di ritornare, per lo stesso
+    // motivo di sempre: la scrittura I2C del guadagno e' affidabile solo
+    // subito dopo kit.begin()). noiseHzInOut e numAvgInOut si applicano
+    // sempre subito, nessun riavvio necessario per questi due.
+    void enterSettingsMenu(uint8_t &gainRegInOut, float &noiseHzInOut, int &numAvgInOut);
 
-    // Persistenza NVS (namespace "thdcfg")
     uint8_t loadGainReg();
     float   loadNoiseThresholdHz();
+    int     loadNumAverages();
     void    saveGainReg(uint8_t reg);
     void    saveNoiseThresholdHz(float hz);
+    void    saveNumAverages(int n);
 
     LiquidCrystal_I2C& lcd() { return lcd_; }
 
   private:
     LiquidCrystal_I2C lcd_;
     Preferences prefs_;
-    uint8_t pinStart_, pinReset_, pinKey3_;
+    uint8_t pinStart_, pinReset_;
 
     void showGainOnLcd(int gain_step, uint8_t gainReg);
-    void showNoiseThresholdOnLcd(float hz);
+    void showNoiseOnLcd(float hz);
+    void showAvgOnLcd(int n);
 };
 
 #endif

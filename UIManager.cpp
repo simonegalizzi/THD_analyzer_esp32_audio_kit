@@ -1,8 +1,8 @@
 #include "UIManager.h"
 
 UIManager::UIManager(uint8_t lcdAddr, uint8_t sdaPin, uint8_t sclPin,
-                       uint8_t pinStart, uint8_t pinReset, uint8_t pinKey3)
-  : lcd_(lcdAddr, 16, 2), pinStart_(pinStart), pinReset_(pinReset), pinKey3_(pinKey3) {
+                       uint8_t pinStart, uint8_t pinReset)
+  : lcd_(lcdAddr, 16, 2), pinStart_(pinStart), pinReset_(pinReset) {
   (void)sdaPin; (void)sclPin; // Wire.begin() va chiamato esternamente nel main
                               // sketch (ordine critico rispetto al codec, vedi setup())
 }
@@ -40,57 +40,187 @@ void UIManager::updateLcd(float thd_percent, float thdn_percent, float last_sign
   lcd_.print(line1);
 }
 
+void UIManager::showSpecialDisplay(float thd_percent, bool stopped) {
+  char line0[17];
+  snprintf(line0, sizeof(line0), "THD:%.3f%%", thd_percent);
+  if (stopped) {
+    int len = strlen(line0);
+    for (int i = len; i < 15; i++) line0[i] = ' ';
+    line0[15] = 'X';
+    line0[16] = '\0';
+  }
+
+  lcd_.setCursor(0, 0);
+  lcd_.print("                ");
+  lcd_.setCursor(0, 0);
+  lcd_.print(line0);
+
+  // Sequenza fissa richiesta, esattamente 16 caratteri: "4  8  17  33  83"
+  lcd_.setCursor(0, 1);
+  lcd_.print("4  8  17  33  83");
+}
+
 void UIManager::showGainOnLcd(int gain_step, uint8_t gainReg) {
   char buf[17];
   int db = gain_step * 3;
-  snprintf(buf, sizeof(buf), "+%2ddB (0x%02X)", db, gainReg);
+  snprintf(buf, sizeof(buf), "+%2ddB (0x%02X)   ", db, gainReg);
   lcd_.setCursor(0, 1);
   lcd_.print(buf);
-  Serial.print("Guadagno selezionato: +");
-  Serial.print(db);
-  Serial.print("dB (reg 0x");
-  Serial.print(gainReg, HEX);
-  Serial.println(")");
 }
 
-void UIManager::enterGainMenu(uint8_t &gainRegInOut) {
-  Serial.println("\n>>> MENU SEGRETO GUADAGNO PGA <<<");
-  Serial.println("RESET = +3dB, START = -3dB, doppia pressione = esci e salva\n");
+void UIManager::showNoiseOnLcd(float hz) {
+  char buf[17];
+  snprintf(buf, sizeof(buf), "%.0f Hz          ", hz);
+  lcd_.setCursor(0, 1);
+  lcd_.print(buf);
+}
+
+void UIManager::showAvgOnLcd(int n) {
+  char buf[17];
+  snprintf(buf, sizeof(buf), "%d letture      ", n);
+  lcd_.setCursor(0, 1);
+  lcd_.print(buf);
+}
+
+// ===================================================================
+// MENU UNIFICATO IMPOSTAZIONI (GAIN / NOISE / AVG)
+// ===================================================================
+// Navigazione con solo due pulsanti:
+//   - RESET singolo = aumenta valore del parametro corrente (risposta immediata)
+//   - START singolo = diminuisce valore del parametro corrente (risposta immediata)
+//   - tap veloce di entrambi insieme = passa al parametro successivo
+//   - tenuta di entrambi ~1.5s = salva ed esce
+enum SettingParam { PARAM_GAIN = 0, PARAM_NOISE = 1, PARAM_AVG = 2, PARAM_COUNT = 3 };
+
+void UIManager::enterSettingsMenu(uint8_t &gainRegInOut, float &noiseHzInOut, int &numAvgInOut) {
+  Serial.println("\n>>> MENU IMPOSTAZIONI <<<");
+  Serial.println("RESET=+ START=- | tap combo=prossimo parametro | tenuta combo 1.5s=esci\n");
+
+  while (digitalRead(pinStart_) == LOW || digitalRead(pinReset_) == LOW) delay(10);
+  delay(100);
 
   int gain_step = gainRegInOut & 0x0F;
   if (gain_step > 8) gain_step = 8;
+  bool gain_modified = false;
 
-  lcd_.clear();
-  lcd_.setCursor(0, 0);
-  lcd_.print("Guadagno PGA:");
-  showGainOnLcd(gain_step, gainRegInOut);
+  int current_param = PARAM_GAIN;
 
-  while (digitalRead(pinStart_) == LOW || digitalRead(pinReset_) == LOW) delay(10);
-  delay(100);
+  auto showCurrentParam = [&]() {
+    lcd_.setCursor(0, 0);
+    lcd_.print("                ");
+    lcd_.setCursor(0, 0);
+    switch (current_param) {
+      case PARAM_GAIN:
+        lcd_.print("GAIN:");
+        showGainOnLcd(gain_step, gainRegInOut);
+        break;
+      case PARAM_NOISE:
+        lcd_.print("NOISE excl.:");
+        showNoiseOnLcd(noiseHzInOut);
+        break;
+      case PARAM_AVG:
+        lcd_.print("MEDIE (AVG):");
+        showAvgOnLcd(numAvgInOut);
+        break;
+    }
+  };
 
-  const unsigned long REPEAT_MS = 220;
-  unsigned long lastReset = 0, lastIn = 0;
-
-  while (true) {
-    bool inState = digitalRead(pinStart_) == LOW;
-    bool resetState = digitalRead(pinReset_) == LOW;
-    unsigned long now = millis();
-
-    if (inState && resetState) {
-      delay(50);
-      if (digitalRead(pinStart_) == LOW && digitalRead(pinReset_) == LOW) break;
-    } else {
-      if (resetState && (now - lastReset) > REPEAT_MS) {
-        lastReset = now;
+  auto applyIncrement = [&]() {
+    switch (current_param) {
+      case PARAM_GAIN:
         if (gain_step < 8) gain_step++;
         gainRegInOut = (uint8_t)((gain_step << 4) | gain_step);
+        gain_modified = true;
         showGainOnLcd(gain_step, gainRegInOut);
-      }
-      if (inState && (now - lastIn) > REPEAT_MS) {
-        lastIn = now;
+        break;
+      case PARAM_NOISE:
+        noiseHzInOut += 5.0f;
+        if (noiseHzInOut > 2000.0f) noiseHzInOut = 2000.0f;
+        showNoiseOnLcd(noiseHzInOut);
+        break;
+      case PARAM_AVG:
+        if (numAvgInOut < 100) numAvgInOut++;
+        showAvgOnLcd(numAvgInOut);
+        break;
+    }
+  };
+
+  auto applyDecrement = [&]() {
+    switch (current_param) {
+      case PARAM_GAIN:
         if (gain_step > 0) gain_step--;
         gainRegInOut = (uint8_t)((gain_step << 4) | gain_step);
+        gain_modified = true;
         showGainOnLcd(gain_step, gainRegInOut);
+        break;
+      case PARAM_NOISE:
+        noiseHzInOut -= 5.0f;
+        if (noiseHzInOut < 0.0f) noiseHzInOut = 0.0f;
+        showNoiseOnLcd(noiseHzInOut);
+        break;
+      case PARAM_AVG:
+        if (numAvgInOut > 1) numAvgInOut--;
+        showAvgOnLcd(numAvgInOut);
+        break;
+    }
+  };
+
+  lcd_.clear();
+  showCurrentParam();
+
+  const unsigned long REPEAT_MS = 200;
+  const unsigned long EXIT_HOLD_MS = 1500;
+  // Dopo che un combo (RESET+START) viene riconosciuto e risolto (cambio
+  // parametro), i pulsanti vengono IGNORATI per questo tempo - non solo
+  // "non eseguiti", ma il loro stato non viene nemmeno considerato per le
+  // normali azioni singole. Serve a coprire il rilascio non perfettamente
+  // simultaneo delle due dita: senza questa pausa, il dito che si alza per
+  // ultimo puo' essere letto come una nuova pressione singola e cambiare
+  // il valore subito dopo il cambio parametro.
+  const unsigned long COMBO_LOCKOUT_MS = 2000;
+  unsigned long lastReset = 0, lastIn = 0;
+  bool combo_holding = false;
+  unsigned long combo_start = 0;
+  unsigned long lockout_until = 0;
+
+  while (true) {
+    unsigned long now = millis();
+    bool locked_out = (now < lockout_until);
+
+    // Durante il lockout, i pin non vengono nemmeno letti per le azioni
+    // singole - solo per capire quando entrambi sono stati rilasciati,
+    // cosi' un pulsante ancora premuto non riparte a contare da zero.
+    bool inState = locked_out ? false : (digitalRead(pinStart_) == LOW);
+    bool resetState = locked_out ? false : (digitalRead(pinReset_) == LOW);
+    bool bothState = inState && resetState;
+
+    if (locked_out) {
+      // Non fare nulla con i pulsanti finche' il lockout non scade
+    } else if (bothState) {
+      if (!combo_holding) {
+        combo_holding = true;
+        combo_start = now;
+      } else if ((now - combo_start) >= EXIT_HOLD_MS) {
+        break; // tenuta lunga -> esci dal menu
+      }
+    } else {
+      if (combo_holding) {
+        // rilasciato prima della soglia di uscita -> tap veloce, prossimo parametro
+        combo_holding = false;
+        current_param = (current_param + 1) % PARAM_COUNT;
+        showCurrentParam();
+        // Blocca la lettura dei pulsanti per un po', per non confondere
+        // il rilascio sfalsato delle due dita con una nuova pressione
+        lockout_until = now + COMBO_LOCKOUT_MS;
+      } else {
+        if (resetState && (now - lastReset) > REPEAT_MS) {
+          lastReset = now;
+          applyIncrement();
+        }
+        if (inState && (now - lastIn) > REPEAT_MS) {
+          lastIn = now;
+          applyDecrement();
+        }
       }
     }
     delay(15);
@@ -98,92 +228,32 @@ void UIManager::enterGainMenu(uint8_t &gainRegInOut) {
 
   while (digitalRead(pinStart_) == LOW || digitalRead(pinReset_) == LOW) delay(10);
 
-  Serial.print("\nGuadagno confermato: +");
-  Serial.print(gain_step * 3);
-  Serial.print("dB (reg 0x");
-  Serial.print(gainRegInOut, HEX);
-  Serial.println(")");
-
-  lcd_.clear();
-  lcd_.setCursor(0, 0);
-  lcd_.print("Salvo e riavvio");
-
-  saveGainReg(gainRegInOut);
-
-  delay(500);
-  ESP.restart();
-}
-
-void UIManager::showNoiseThresholdOnLcd(float hz) {
-  char buf[17];
-  snprintf(buf, sizeof(buf), "%.0f Hz       ", hz);
-  lcd_.setCursor(0, 1);
-  lcd_.print(buf);
-  Serial.print("Soglia esclusione rumore: ");
-  Serial.print(hz, 1);
-  Serial.println(" Hz");
-}
-
-void UIManager::enterNoiseMenu(float &noiseHzInOut) {
-  Serial.println("\n>>> MENU SOGLIA ESCLUSIONE RUMORE <<<");
-  Serial.println("RESET = aumenta, START = diminuisci, KEY3 = esci e salva\n");
-
-  lcd_.clear();
-  lcd_.setCursor(0, 0);
-  lcd_.print("Soglia rumore:");
-  showNoiseThresholdOnLcd(noiseHzInOut);
-
-  while (digitalRead(pinKey3_) == LOW) delay(10);
-  delay(100);
-
-  const unsigned long REPEAT_MS = 150;
-  const float STEP_HZ = 5.0f;
-  const float MIN_HZ = 0.0f;
-  const float MAX_HZ = 2000.0f;
-  unsigned long lastReset = 0, lastIn = 0;
-
-  while (true) {
-    bool inState = digitalRead(pinStart_) == LOW;
-    bool resetState = digitalRead(pinReset_) == LOW;
-    bool key3State = digitalRead(pinKey3_) == LOW;
-    unsigned long now = millis();
-
-    if (key3State) {
-      delay(50);
-      if (digitalRead(pinKey3_) == LOW) break;
-    } else {
-      if (resetState && (now - lastReset) > REPEAT_MS) {
-        lastReset = now;
-        noiseHzInOut += STEP_HZ;
-        if (noiseHzInOut > MAX_HZ) noiseHzInOut = MAX_HZ;
-        showNoiseThresholdOnLcd(noiseHzInOut);
-      }
-      if (inState && (now - lastIn) > REPEAT_MS) {
-        lastIn = now;
-        noiseHzInOut -= STEP_HZ;
-        if (noiseHzInOut < MIN_HZ) noiseHzInOut = MIN_HZ;
-        showNoiseThresholdOnLcd(noiseHzInOut);
-      }
-    }
-    delay(15);
-  }
-
-  while (digitalRead(pinKey3_) == LOW) delay(10);
-
-  Serial.print("\nSoglia confermata: ");
-  Serial.print(noiseHzInOut, 1);
-  Serial.println(" Hz - applicata immediatamente, nessun riavvio necessario");
-
-  lcd_.clear();
-  lcd_.setCursor(0, 0);
-  lcd_.print("Soglia salvata");
+  Serial.print("Guadagno: +"); Serial.print(gain_step * 3); Serial.println("dB");
+  Serial.print("Soglia rumore: "); Serial.print(noiseHzInOut, 1); Serial.println(" Hz");
+  Serial.print("Numero medie: "); Serial.println(numAvgInOut);
 
   saveNoiseThresholdHz(noiseHzInOut);
+  saveNumAverages(numAvgInOut);
 
-  delay(800);
-  lcd_.clear();
-  lcd_.setCursor(0, 0);
-  lcd_.print("Pronto...");
+  if (gain_modified) {
+    saveGainReg(gainRegInOut);
+    lcd_.clear();
+    lcd_.setCursor(0, 0);
+    lcd_.print("Salvo e riavvio");
+    Serial.println("Guadagno modificato - riavvio per applicare...");
+    delay(500);
+    ESP.restart();
+  } else {
+    lcd_.clear();
+    lcd_.setCursor(0, 0);
+    lcd_.print("Impostazioni");
+    lcd_.setCursor(0, 1);
+    lcd_.print("salvate");
+    delay(800);
+    lcd_.clear();
+    lcd_.setCursor(0, 0);
+    lcd_.print("Pronto...");
+  }
 }
 
 uint8_t UIManager::loadGainReg() {
@@ -198,6 +268,19 @@ float UIManager::loadNoiseThresholdHz() {
   float v = prefs_.getFloat("noiseHz", 100.0f);
   prefs_.end();
   return v;
+}
+
+int UIManager::loadNumAverages() {
+  prefs_.begin("thdcfg", false);
+  int v = prefs_.getInt("numAvg", 4);
+  prefs_.end();
+  return v;
+}
+
+void UIManager::saveNumAverages(int n) {
+  prefs_.begin("thdcfg", false);
+  prefs_.putInt("numAvg", n);
+  prefs_.end();
 }
 
 void UIManager::saveGainReg(uint8_t reg) {
