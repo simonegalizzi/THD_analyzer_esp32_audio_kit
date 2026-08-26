@@ -28,10 +28,24 @@ using namespace audio_tools;
 #include "THDAnalyzer.h"
 #include "ES8388Helper.h"
 #include "UIManager.h"
+#include <Preferences.h>
 
 // ===== CONFIGURAZIONE =====
+// FFT_SIZE ora rappresenta la capacita' MASSIMA allocata (buffer PSRAM).
+// La dimensione effettivamente USATA e' fft_size_current, modificabile a
+// runtime via comando seriale "FFTSIZE <n>" tra i valori consentiti sotto,
+// senza bisogno di riavviare la scheda (nessuna riallocazione di memoria).
 #define FFT_SIZE 65536
 #define FS       96000
+
+// Valori di FFT size ammessi (potenze di 2, dimensioni "leggibili" a passi
+// di ottava). Valori piu' piccoli = misura piu' veloce ma risoluzione in
+// frequenza (Hz/bin) piu' grossolana.
+const int FFT_SIZE_OPTIONS[] = {4096, 8192, 16384, 32768, 65536};
+const int FFT_SIZE_OPTIONS_COUNT = 5;
+int fft_size_current = FFT_SIZE;
+
+Preferences fftPrefs; // namespace separato, non tocca "thdcfg" di UIManager
 
 #define LCD_I2C_ADDR 0x27
 const int PIN_START = 36;   // GPIO36 input-only, serve pull-up esterna 10k
@@ -52,14 +66,6 @@ bool combo_holding = false;
 unsigned long combo_hold_start = 0;
 bool combo_long_fired = false;
 bool special_display_active = false;
-
-// Dopo che un combo (RESET+START) viene riconosciuto e risolto, i pulsanti
-// vengono IGNORATI per questo tempo - i pin non vengono nemmeno letti per
-// le azioni singole. Copre il caso in cui le due dita si rilasciano non
-// esattamente insieme: senza questa pausa, il dito che si alza per ultimo
-// puo' essere letto come una nuova pressione singola subito dopo il combo.
-const unsigned long OUTER_LOCKOUT_MS = 1000;
-unsigned long outer_lockout_until = 0;
 
 // ===== OGGETTI GLOBALI (uno per sottosistema) =====
 THDAnalyzer analyzer(FFT_SIZE, FS);
@@ -92,18 +98,15 @@ float frequenza = 0.0f;
 
 uint8_t pga_reg_value = 0x00;
 
-// Gestione differita pressione singola: quando un pulsante viene premuto,
-// non esegue l'azione immediatamente ma attende COMBO_GRACE_MS, per dare
-// tempo all'altro pulsante di unirsi e formare un combo (RESET+START).
-// Se in quella finestra si preme anche l'altro, l'azione singola viene
-// annullata e gestita come combo invece. Alza questo valore se ti risulta
-// ancora difficile centrare la doppia pressione (a scapito di un lieve
-// ritardo percepito su ogni pressione singola).
-const unsigned long COMBO_GRACE_MS = 300;
-bool start_pending = false, start_fired = false;
-unsigned long start_pending_since = 0;
-bool reset_pending = false, reset_fired = false;
-unsigned long reset_pending_since = 0;
+// Stato per la finestra "chord" anti-combo-mancata (stesso concetto usato
+// nel menu impostazioni di UIManager): un pulsante premuto da solo non
+// scatta subito, aspetta CHORD_WINDOW_MS per dare tempo al secondo dito
+// di arrivare - se arriva, e' una combo e l'azione singola non parte mai.
+bool start_pending = false, start_confirmed = false;
+bool reset_pending = false, reset_confirmed = false;
+unsigned long start_pending_since = 0, reset_pending_since = 0;
+const unsigned long CHORD_WINDOW_MS = 180;
+
 unsigned long last_button_time_start = 0, last_button_time_reset = 0;
 const unsigned long DEBOUNCE_MS = 800;
 
@@ -136,6 +139,47 @@ int readAudioKitBlock(float32_t *dest, int start_idx, float &maxAbsOut, int &cli
 
 bool stopRequested() {
   return digitalRead(PIN_START) == LOW;
+}
+
+// Trova il valore ammesso piu' vicino a n (evita di dover indovinare
+// l'esatta potenza di 2 da seriale o dall'app: es. 30000 -> 32768).
+int snapToNearestFftSize(int n) {
+  int best = FFT_SIZE_OPTIONS[0];
+  int bestDiff = abs(n - best);
+  for (int i = 1; i < FFT_SIZE_OPTIONS_COUNT; i++) {
+    int diff = abs(n - FFT_SIZE_OPTIONS[i]);
+    if (diff < bestDiff) {
+      bestDiff = diff;
+      best = FFT_SIZE_OPTIONS[i];
+    }
+  }
+  return best;
+}
+
+int loadFftSize() {
+  fftPrefs.begin("thdfft", false);
+  int v = fftPrefs.getInt("size", FFT_SIZE);
+  fftPrefs.end();
+  return snapToNearestFftSize(v);
+}
+
+void saveFftSize(int n) {
+  fftPrefs.begin("thdfft", false);
+  fftPrefs.putInt("size", n);
+  fftPrefs.end();
+}
+
+// Applica una nuova dimensione FFT: aggiorna l'analyzer, ricalibra il DC
+// offset (dipende dal numero di campioni), resetta i buffer di sessione.
+// Nessun riavvio necessario (a differenza di GAIN).
+bool applyFftSize(int n) {
+  int snapped = snapToNearestFftSize(n);
+  if (!analyzer.setActiveFftSize(snapped)) return false;
+  fft_size_current = snapped;
+  saveFftSize(snapped);
+  analyzer.calibrateDcOffset(readAudioKitBlock);
+  resetBuffers();
+  return true;
 }
 
 void resetBuffers() {
@@ -293,6 +337,20 @@ void handleSerialCommands() {
     Serial.print("Numero di medie impostato a ");
     Serial.println(num_averages);
   }
+  else if (cmd == "FFTSIZE") {
+    int n = argStr.toInt();
+    if (n <= 0) {
+      Serial.println("Valore non valido. Valori ammessi: 4096, 8192, 16384, 32768, 65536");
+    } else if (applyFftSize(n)) {
+      Serial.print("FFT size impostata a ");
+      Serial.print(fft_size_current);
+      Serial.print(" punti (risoluzione ");
+      Serial.print(analyzer.binHz(), 3);
+      Serial.println(" Hz/bin) - applicata subito, nessun riavvio necessario");
+    } else {
+      Serial.println("Impossibile applicare la FFT size richiesta.");
+    }
+  }
   else if (cmd == "STATUS" || cmd == "?") {
     Serial.println("--- Stato configurazione ---");
     Serial.print("Guadagno PGA: +");
@@ -305,10 +363,15 @@ void handleSerialCommands() {
     Serial.println(" Hz");
     Serial.print("Numero di medie: ");
     Serial.println(num_averages);
+    Serial.print("FFT size: ");
+    Serial.print(fft_size_current);
+    Serial.print(" punti (");
+    Serial.print(analyzer.binHz(), 3);
+    Serial.println(" Hz/bin)");
   }
   else {
     Serial.println("Comando non riconosciuto.");
-    Serial.println("Comandi disponibili: GAIN <0-8>, NOISE <hz>, AVG <n>, STATUS");
+    Serial.println("Comandi disponibili: GAIN <0-8>, NOISE <hz>, AVG <n>, FFTSIZE <4096-65536>, STATUS");
   }
 }
 
@@ -343,7 +406,16 @@ void setup() {
   Serial.println(" Hz");
   Serial.print("Numero di medie caricato da NVS: ");
   Serial.println(num_averages);
-  Serial.println("\nComandi seriali disponibili: GAIN <0-8>, NOISE <hz>, AVG <n>, STATUS");
+
+  fft_size_current = loadFftSize();
+  if (fft_size_current != FFT_SIZE) {
+    analyzer.setActiveFftSize(fft_size_current);
+  }
+  Serial.print("FFT size caricata da NVS: ");
+  Serial.print(fft_size_current);
+  Serial.println(" punti");
+
+  Serial.println("\nComandi seriali disponibili: GAIN <0-8>, NOISE <hz>, AVG <n>, FFTSIZE <4096-65536>, STATUS");
 
   // ===== INIZIALIZZAZIONE CODEC ES8388 =====
   auto cfg = kit.defaultConfig(RX_MODE);
@@ -384,20 +456,18 @@ void setup() {
 // ===================================================================
 void loop() {
   unsigned long now = millis();
-  bool locked_out = (now < outer_lockout_until);
 
-  // --- Combo START+RESET: distingue pressione breve (menu impostazioni) da
-  // pressione tenuta ~4s (display speciale). Durante il lockout post-combo
-  // (vedi OUTER_LOCKOUT_MS sopra), i pin non vengono nemmeno letti.
-  bool startState = locked_out ? false : (digitalRead(PIN_START) == LOW);
-  bool resetState = locked_out ? false : (digitalRead(PIN_RESET) == LOW);
-  bool both_pressed = startState && resetState;
+  // --- Combo START+RESET: distingue pressione breve (menu guadagno, come
+  // prima) da pressione tenuta ~4s (display speciale, nuovo). A differenza
+  // della vecchia logica (che apriva il menu ISTANTANEAMENTE alla pressione),
+  // ora si aspetta il rilascio per decidere se e' stata breve o lunga -
+  // unico modo per poter distinguere le due durate senza bloccare il loop.
+  bool both_pressed = (digitalRead(PIN_START) == LOW && digitalRead(PIN_RESET) == LOW);
 
-  if (locked_out) {
-    // Non fare nulla con i pulsanti finche' il lockout non scade
-  } else if (both_pressed) {
-    // E' un combo vero -> annulla eventuali azioni singole "in sospeso"
-    // che stavano solo aspettando conferma (vedi COMBO_GRACE_MS sotto)
+  if (both_pressed) {
+    // Combo confermata: annulla qualsiasi azione singola ancora "in attesa"
+    // - era solo il primo dito arrivato prima del secondo, non deve mai
+    // scattare come pressione singola.
     start_pending = false;
     reset_pending = false;
 
@@ -410,106 +480,125 @@ void loop() {
       special_display_active = true;
       Serial.println("\n>>> Display speciale ATTIVATO (combo tenuta 4s) <<<");
       ui.showSpecialDisplay(last_thd_percent, !acquisition_active);
-      // Blocca la lettura dei pulsanti: le due dita potrebbero non
-      // rilasciarsi esattamente insieme nei prossimi istanti
-      outer_lockout_until = now + OUTER_LOCKOUT_MS;
     }
   } else {
     if (combo_holding && !combo_long_fired && (now - last_combo_time) > COMBO_DEBOUNCE_MS) {
-      // Rilasciato prima dei 4s -> menu impostazioni unificato
+      // Rilasciato prima dei 4s -> comportamento originale: menu guadagno
       last_combo_time = now;
 
+      // Ferma l'acquisizione PRIMA di entrare nel menu, stesso comportamento
+      // del pulsante STOP - evita di riprendere dopo il menu con campioni
+      // "vecchi" accumulati nel buffer I2S durante la navigazione, e chiude
+      // correttamente la sessione (media, clip count) come farebbe STOP.
       if (acquisition_active) {
         Serial.println(">>> Acquisizione fermata per apertura menu impostazioni <<<");
         acquisition_active = false;
         evaluateSignalLevel();
       }
 
+      // Rilasciato prima dei 4s -> menu impostazioni unificato (GAIN/NOISE/AVG/FFT)
       float noise_hz = analyzer.getNoiseExcludeBelowHz();
-      ui.enterSettingsMenu(pga_reg_value, noise_hz, num_averages);
+      int fft_size_before_menu = fft_size_current;
+      ui.enterSettingsMenu(pga_reg_value, noise_hz, num_averages, fft_size_current);
+      // Se enterSettingsMenu ritorna (nessun riavvio, cioe' GAIN non toccato),
+      // applica subito la nuova soglia rumore in memoria. L'acquisizione
+      // resta ferma: l'utente deve premere START per riprendere esplicitamente.
       analyzer.setNoiseExcludeBelowHz(noise_hz);
+      if (fft_size_current != fft_size_before_menu) {
+        // applyFftSize ricalibra il DC offset e resetta i buffer di sessione,
+        // oltre a salvare il nuovo valore in NVS (stesso percorso del
+        // comando seriale FFTSIZE).
+        applyFftSize(fft_size_current);
+      }
       ui.updateLcd(last_thd_percent, last_thdn_percent, last_campioni, true);
-      // enterSettingsMenu attende gia' internamente il rilascio completo
-      // prima di ritornare, ma aggiungiamo comunque un piccolo lockout
-      // per uniformita' e sicurezza extra
-      outer_lockout_until = now + OUTER_LOCKOUT_MS;
     }
     combo_holding = false;
   }
   if (both_pressed) return;
 
-  // --- Pulsante START/STOP -----------------------------------------------
-  // Non scatta piu' istantaneamente al fronte di discesa: attende
-  // COMBO_GRACE_MS per dare tempo all'altro pulsante di unirsi e formare
-  // un combo. Se entro quel tempo si preme anche RESET, questa pressione
-  // viene annullata (sopra, "start_pending = false") e gestita come combo.
-  if (startState) {
-    if (!start_pending) {
+  // (KEY3 rimosso: la sua funzione e' ora nel menu unificato sopra)
+
+  bool pinIn_state = digitalRead(PIN_START);
+
+  if (pinIn_state == LOW) {
+    if (!start_pending && !start_confirmed) {
+      // Nuova pressione rilevata: non agire subito, aspetta la finestra
+      // chord per dare tempo all'altro pulsante (combo) di arrivare.
       start_pending = true;
       start_pending_since = now;
-      start_fired = false;
-    } else if (!start_fired && (now - start_pending_since) >= COMBO_GRACE_MS
-               && (now - last_button_time_start) > DEBOUNCE_MS) {
-      start_fired = true;
-      last_button_time_start = now;
+    } else if (start_pending && (now - start_pending_since) >= CHORD_WINDOW_MS) {
+      start_pending = false;
+      start_confirmed = true; // evita di rifirare finche' non rilasci il pulsante
 
-      if (special_display_active) {
-        special_display_active = false;
-        Serial.println(">>> Display speciale disattivato <<<");
-      }
+      if ((now - last_button_time_start) > DEBOUNCE_MS) {
+        last_button_time_start = now;
 
-      acquisition_active = !acquisition_active;
-
-      if (acquisition_active) {
-        Serial.println("\n>>> START acquisizione <<<");
-        ui.lcd().clear();
-        ui.lcd().setCursor(2, 0);
-        ui.lcd().print("read buffer");
-        resetBuffers();
-        for (int flush = 0; flush < 8; flush++) {
-          kit.readBytes((uint8_t*)raw_block, sizeof(raw_block));
+        // Se il display speciale e' attivo, questa pressione lo chiude E
+        // comunque esegue la normale funzione START/STOP (nessuna azione persa)
+        if (special_display_active) {
+          special_display_active = false;
+          Serial.println(">>> Display speciale disattivato <<<");
         }
-      } else {
-        Serial.println(">>> STOP acquisizione <<<");
-        evaluateSignalLevel();
-        ui.updateLcd(last_thd_percent, last_thdn_percent, last_campioni, true);
+
+        acquisition_active = !acquisition_active;
+
+        if (acquisition_active) {
+          Serial.println("\n>>> START acquisizione <<<");
+          ui.lcd().clear();
+          ui.lcd().setCursor(2, 0);
+          ui.lcd().print("read buffer");
+          resetBuffers();
+          for (int flush = 0; flush < 8; flush++) {
+            kit.readBytes((uint8_t*)raw_block, sizeof(raw_block));
+          }
+        } else {
+          Serial.println(">>> STOP acquisizione <<<");
+          evaluateSignalLevel();
+          ui.updateLcd(last_thd_percent, last_thdn_percent, last_campioni, true);
+        }
       }
     }
   } else {
     start_pending = false;
+    start_confirmed = false;
   }
 
-  // --- Pulsante RESET ------------------------------------------------------
-  // Stessa logica di grazia del pulsante START/STOP.
-  if (resetState) {
-    if (!reset_pending) {
+  bool pinReset_state = digitalRead(PIN_RESET);
+
+  if (pinReset_state == LOW) {
+    if (!reset_pending && !reset_confirmed) {
       reset_pending = true;
       reset_pending_since = now;
-      reset_fired = false;
-    } else if (!reset_fired && (now - reset_pending_since) >= COMBO_GRACE_MS
-               && (now - last_button_time_reset) > DEBOUNCE_MS) {
-      reset_fired = true;
-      last_button_time_reset = now;
+    } else if (reset_pending && (now - reset_pending_since) >= CHORD_WINDOW_MS) {
+      reset_pending = false;
+      reset_confirmed = true;
 
-      if (special_display_active) {
-        special_display_active = false;
-        Serial.println(">>> Display speciale disattivato <<<");
+      if ((now - last_button_time_reset) > DEBOUNCE_MS) {
+        last_button_time_reset = now;
+
+        // Stesso comportamento del pulsante START: chiude il display speciale
+        // ed esegue comunque il normale RESET, senza azioni perse.
+        if (special_display_active) {
+          special_display_active = false;
+          Serial.println(">>> Display speciale disattivato <<<");
+        }
+
+        Serial.println(">>> RESET campioni <<<");
+        resetBuffers();
+        ui.lcd().clear();
+        ui.lcd().setCursor(0, 0);
+        ui.lcd().print("Reset...");
+        ui.lcd().setCursor(0, 1);
+        char freq_disp[16];
+        snprintf(freq_disp, sizeof(freq_disp), "Freq:%d", (int)frequenza);
+        ui.lcd().print(freq_disp);
+        delay(1000);
+        if (!acquisition_active) ui.updateLcd(last_thd_percent, last_thdn_percent, last_campioni, true);
       }
-
-      Serial.println(">>> RESET campioni <<<");
-      resetBuffers();
-      ui.lcd().clear();
-      ui.lcd().setCursor(0, 0);
-      ui.lcd().print("Reset...");
-      ui.lcd().setCursor(0, 1);
-      char freq_disp[16];
-      snprintf(freq_disp, sizeof(freq_disp), "Freq:%d", (int)frequenza);
-      ui.lcd().print(freq_disp);
-      delay(1000);
-      if (!acquisition_active) ui.updateLcd(last_thd_percent, last_thdn_percent, last_campioni, true);
     }
   } else {
     reset_pending = false;
+    reset_confirmed = false;
   }
 
   if (acquisition_active) {

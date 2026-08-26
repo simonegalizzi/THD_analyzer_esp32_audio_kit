@@ -24,16 +24,19 @@ class UIManager {
     // '4' in colonna 0, ultimo '3' di 83 in colonna 15).
     void showSpecialDisplay(float thd_percent, bool stopped);
 
-    // Menu unificato impostazioni (GAIN / NOISE / AVG), navigabile con
+    // Menu unificato impostazioni (GAIN / NOISE / AVG / FFT), navigabile con
     // solo due pulsanti - sostituisce i vecchi menu separati e KEY3.
     // Bloccante: ritorna solo all'uscita (tenuta combo ~1.5s).
     // gainRegInOut viene aggiornato E salvato SOLO se il parametro GAIN
     // e' stato effettivamente toccato durante la sessione di menu (in tal
     // caso la funzione riavvia la scheda prima di ritornare, per lo stesso
     // motivo di sempre: la scrittura I2C del guadagno e' affidabile solo
-    // subito dopo kit.begin()). noiseHzInOut e numAvgInOut si applicano
-    // sempre subito, nessun riavvio necessario per questi due.
-    void enterSettingsMenu(uint8_t &gainRegInOut, float &noiseHzInOut, int &numAvgInOut);
+    // subito dopo kit.begin()). noiseHzInOut, numAvgInOut e fftSizeInOut si
+    // applicano sempre subito, nessun riavvio necessario per questi tre.
+    // fftSizeInOut viene solo CICLATO tra i valori ammessi (4096..65536):
+    // sta al chiamante (.ino) applicarlo davvero all'analyzer dopo il ritorno,
+    // dato che UIManager non conosce THDAnalyzer.
+    void enterSettingsMenu(uint8_t &gainRegInOut, float &noiseHzInOut, int &numAvgInOut, int &fftSizeInOut);
 
     uint8_t loadGainReg();
     float   loadNoiseThresholdHz();
@@ -52,6 +55,7 @@ class UIManager {
     void showGainOnLcd(int gain_step, uint8_t gainReg);
     void showNoiseOnLcd(float hz);
     void showAvgOnLcd(int n);
+    void showFftOnLcd(int fftSize);
 };
 
 #endif

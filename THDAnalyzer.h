@@ -53,11 +53,20 @@ class THDAnalyzer {
     float getNoiseExcludeBelowHz() const { return noise_exclude_below_hz_; }
 
     int fftSize() const { return fft_size_; }
+    int maxFftSize() const { return fft_size_max_; }
     int sampleRate() const { return fs_; }
     float binHz() const { return (float)fs_ / fft_size_; }
 
+    // Cambia la dimensione FFT attiva senza riallocare memoria (i buffer
+    // restano dimensionati al massimo usato in costruzione/begin()).
+    // n deve essere una potenza di 2, compresa tra 256 e maxFftSize().
+    // Rigenera la finestra Blackman-Harris per la nuova dimensione.
+    // Ritorna false (e non applica nulla) se n non e' valido.
+    bool setActiveFftSize(int n);
+
   private:
-    int fft_size_;
+    int fft_size_;      // dimensione FFT ATTIVA (puo' cambiare a runtime, <= fft_size_max_)
+    int fft_size_max_;  // dimensione con cui sono stati allocati i buffer (fissa, mai riallocata)
     int fs_;
 
     float32_t *fft_input_ = nullptr;

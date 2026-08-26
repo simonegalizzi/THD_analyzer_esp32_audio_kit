@@ -1,6 +1,6 @@
 #include "THDAnalyzer.h"
 
-THDAnalyzer::THDAnalyzer(int fft_size, int fs) : fft_size_(fft_size), fs_(fs) {}
+THDAnalyzer::THDAnalyzer(int fft_size, int fs) : fft_size_(fft_size), fft_size_max_(fft_size), fs_(fs) {}
 
 THDAnalyzer::~THDAnalyzer() {
   // Nessun free esplicito: i buffer vivono per tutta la durata dello sketch,
@@ -20,22 +20,22 @@ bool THDAnalyzer::begin() {
     Serial.println(" KB");
   }
 
-  fft_input_ = (float32_t*) ps_malloc(sizeof(float32_t) * fft_size_);
-  fft_re_    = (float32_t*) ps_malloc(sizeof(float32_t) * fft_size_);
-  fft_im_    = (float32_t*) ps_malloc(sizeof(float32_t) * fft_size_);
-  window_    = (float32_t*) ps_malloc(sizeof(float32_t) * fft_size_);
-  powerSpec_ = (float32_t*) ps_malloc(sizeof(float32_t) * (fft_size_ / 2));
+  fft_input_ = (float32_t*) ps_malloc(sizeof(float32_t) * fft_size_max_);
+  fft_re_    = (float32_t*) ps_malloc(sizeof(float32_t) * fft_size_max_);
+  fft_im_    = (float32_t*) ps_malloc(sizeof(float32_t) * fft_size_max_);
+  window_    = (float32_t*) ps_malloc(sizeof(float32_t) * fft_size_max_);
+  powerSpec_ = (float32_t*) ps_malloc(sizeof(float32_t) * (fft_size_max_ / 2));
 
   if (!fft_input_ || !fft_re_ || !fft_im_ || !window_ || !powerSpec_) {
     Serial.println("ERRORE: allocazione buffer FFT fallita (memoria insufficiente)!");
     return false;
   }
 
-  memset(fft_input_, 0, sizeof(float32_t) * fft_size_);
-  memset(fft_re_, 0, sizeof(float32_t) * fft_size_);
-  memset(fft_im_, 0, sizeof(float32_t) * fft_size_);
-  memset(window_, 0, sizeof(float32_t) * fft_size_);
-  memset(powerSpec_, 0, sizeof(float32_t) * (fft_size_ / 2));
+  memset(fft_input_, 0, sizeof(float32_t) * fft_size_max_);
+  memset(fft_re_, 0, sizeof(float32_t) * fft_size_max_);
+  memset(fft_im_, 0, sizeof(float32_t) * fft_size_max_);
+  memset(window_, 0, sizeof(float32_t) * fft_size_max_);
+  memset(powerSpec_, 0, sizeof(float32_t) * (fft_size_max_ / 2));
 
   Serial.println("Buffer FFT allocati correttamente.");
   makeBlackmanHarris7();
@@ -69,6 +69,30 @@ void THDAnalyzer::makeBlackmanHarris7() {
                 + a6 * cosf(6 * x);
   }
   Serial.println(" OK");
+}
+
+bool THDAnalyzer::setActiveFftSize(int n) {
+  // Deve essere una potenza di 2, compresa tra 256 e la capacita' allocata.
+  bool isPowerOfTwo = n > 0 && (n & (n - 1)) == 0;
+  if (!isPowerOfTwo || n < 256 || n > fft_size_max_) {
+    Serial.print("FFT size non valida: ");
+    Serial.print(n);
+    Serial.print(" (deve essere potenza di 2 tra 256 e ");
+    Serial.print(fft_size_max_);
+    Serial.println(")");
+    return false;
+  }
+
+  fft_size_ = n;
+  makeBlackmanHarris7(); // la finestra dipende da N, va rigenerata per la nuova dimensione
+  dc_calibrated_ = false; // il DC offset e' stato calibrato sulla vecchia dimensione: da rifare
+
+  Serial.print("FFT size cambiata a ");
+  Serial.print(fft_size_);
+  Serial.print(" punti (risoluzione ");
+  Serial.print(binHz(), 3);
+  Serial.println(" Hz/bin)");
+  return true;
 }
 
 // Bit-reversal + butterfly, identica all'originale (nessuna dipendenza esterna,

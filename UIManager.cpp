@@ -82,6 +82,26 @@ void UIManager::showAvgOnLcd(int n) {
   lcd_.print(buf);
 }
 
+void UIManager::showFftOnLcd(int fftSize) {
+  char buf[17];
+  snprintf(buf, sizeof(buf), "%d pti      ", fftSize);
+  lcd_.setCursor(0, 1);
+  lcd_.print(buf);
+}
+
+// Valori FFT ammessi per il ciclo nel menu - DEVONO restare identici
+// all'array FFT_SIZE_OPTIONS dichiarato in THD_v18_serial.ino (stesso
+// insieme di potenze di 2 accettate da THDAnalyzer::setActiveFftSize).
+static const int MENU_FFT_OPTIONS[] = {4096, 8192, 16384, 32768, 65536};
+static const int MENU_FFT_OPTIONS_COUNT = 5;
+
+static int fftIndexFromValue(int value) {
+  for (int i = 0; i < MENU_FFT_OPTIONS_COUNT; i++) {
+    if (MENU_FFT_OPTIONS[i] == value) return i;
+  }
+  return MENU_FFT_OPTIONS_COUNT - 1; // valore sconosciuto -> default al massimo
+}
+
 // ===================================================================
 // MENU UNIFICATO IMPOSTAZIONI (GAIN / NOISE / AVG)
 // ===================================================================
@@ -90,9 +110,9 @@ void UIManager::showAvgOnLcd(int n) {
 //   - START singolo = diminuisce valore del parametro corrente (risposta immediata)
 //   - tap veloce di entrambi insieme = passa al parametro successivo
 //   - tenuta di entrambi ~1.5s = salva ed esce
-enum SettingParam { PARAM_GAIN = 0, PARAM_NOISE = 1, PARAM_AVG = 2, PARAM_COUNT = 3 };
+enum SettingParam { PARAM_GAIN = 0, PARAM_NOISE = 1, PARAM_AVG = 2, PARAM_FFT = 3, PARAM_COUNT = 4 };
 
-void UIManager::enterSettingsMenu(uint8_t &gainRegInOut, float &noiseHzInOut, int &numAvgInOut) {
+void UIManager::enterSettingsMenu(uint8_t &gainRegInOut, float &noiseHzInOut, int &numAvgInOut, int &fftSizeInOut) {
   Serial.println("\n>>> MENU IMPOSTAZIONI <<<");
   Serial.println("RESET=+ START=- | tap combo=prossimo parametro | tenuta combo 1.5s=esci\n");
 
@@ -102,6 +122,8 @@ void UIManager::enterSettingsMenu(uint8_t &gainRegInOut, float &noiseHzInOut, in
   int gain_step = gainRegInOut & 0x0F;
   if (gain_step > 8) gain_step = 8;
   bool gain_modified = false;
+
+  int fft_index = fftIndexFromValue(fftSizeInOut);
 
   int current_param = PARAM_GAIN;
 
@@ -121,6 +143,10 @@ void UIManager::enterSettingsMenu(uint8_t &gainRegInOut, float &noiseHzInOut, in
       case PARAM_AVG:
         lcd_.print("MEDIE (AVG):");
         showAvgOnLcd(numAvgInOut);
+        break;
+      case PARAM_FFT:
+        lcd_.print("FFT SIZE:");
+        showFftOnLcd(fftSizeInOut);
         break;
     }
   };
@@ -142,6 +168,11 @@ void UIManager::enterSettingsMenu(uint8_t &gainRegInOut, float &noiseHzInOut, in
         if (numAvgInOut < 100) numAvgInOut++;
         showAvgOnLcd(numAvgInOut);
         break;
+      case PARAM_FFT:
+        if (fft_index < MENU_FFT_OPTIONS_COUNT - 1) fft_index++;
+        fftSizeInOut = MENU_FFT_OPTIONS[fft_index];
+        showFftOnLcd(fftSizeInOut);
+        break;
     }
   };
 
@@ -162,14 +193,19 @@ void UIManager::enterSettingsMenu(uint8_t &gainRegInOut, float &noiseHzInOut, in
         if (numAvgInOut > 1) numAvgInOut--;
         showAvgOnLcd(numAvgInOut);
         break;
+      case PARAM_FFT:
+        if (fft_index > 0) fft_index--;
+        fftSizeInOut = MENU_FFT_OPTIONS[fft_index];
+        showFftOnLcd(fftSizeInOut);
+        break;
     }
   };
 
   lcd_.clear();
   showCurrentParam();
 
-  const unsigned long REPEAT_MS = 200;
-  const unsigned long EXIT_HOLD_MS = 1500;
+  const unsigned long REPEAT_MS = 200; //Velocità di ripetizione mentre tieni premuto un solo pulsante (dopo la prima azione confermata)
+  const unsigned long EXIT_HOLD_MS = 1500; //	Quanto tenere la combo per uscire dal menu
   // Dopo che un combo (RESET+START) viene riconosciuto e risolto (cambio
   // parametro), i pulsanti vengono IGNORATI per questo tempo - non solo
   // "non eseguiti", ma il loro stato non viene nemmeno considerato per le
@@ -177,11 +213,25 @@ void UIManager::enterSettingsMenu(uint8_t &gainRegInOut, float &noiseHzInOut, in
   // simultaneo delle due dita: senza questa pausa, il dito che si alza per
   // ultimo puo' essere letto come una nuova pressione singola e cambiare
   // il valore subito dopo il cambio parametro.
-  const unsigned long COMBO_LOCKOUT_MS = 2000;
+  const unsigned long COMBO_LOCKOUT_MS = 2000; //	Tempo di "silenzio" dopo un cambio-parametro, per ignorare il rilascio sfalsato delle due dita
+  // NUOVO: quanto aspettare, quando SOLO un pulsante risulta premuto, prima
+  // di eseguire davvero l'incremento/decremento singolo. Da' tempo al
+  // secondo dito di arrivare: se entro questa finestra scatta anche l'altro
+  // pulsante, viene riconosciuta la combo e l'azione singola NON parte mai.
+  // Se premendo la combo ti capita ancora di alterare il valore prima di
+  // uscire, alza questo numero (es. 250-300ms); se il singolo pulsante ti
+  // sembra "pigro" a rispondere, abbassalo (min. consigliato ~100ms).
+  const unsigned long CHORD_WINDOW_MS = 180; //	Quella che ti serve. Tempo di attesa prima di eseguire un incremento/decremento da pulsante singolo, per dare margine al secondo dito. Se ti capita ancora di alterare il valore, alzalo (prova 250-300ms)
+
   unsigned long lastReset = 0, lastIn = 0;
   bool combo_holding = false;
   unsigned long combo_start = 0;
   unsigned long lockout_until = 0;
+
+  // Stato della finestra "chord" per i due pulsanti singoli.
+  bool reset_pending = false, in_pending = false;
+  unsigned long reset_pending_since = 0, in_pending_since = 0;
+  bool reset_active = false, in_active = false;
 
   while (true) {
     unsigned long now = millis();
@@ -197,30 +247,63 @@ void UIManager::enterSettingsMenu(uint8_t &gainRegInOut, float &noiseHzInOut, in
     if (locked_out) {
       // Non fare nulla con i pulsanti finche' il lockout non scade
     } else if (bothState) {
+      // Combo confermata: annulla qualsiasi azione singola ancora "in
+      // sospeso" o "attiva" - non deve mai essere eseguita, era solo
+      // il primo dito arrivato prima del secondo.
+      reset_pending = false; in_pending = false;
+      reset_active = false; in_active = false;
+
       if (!combo_holding) {
         combo_holding = true;
         combo_start = now;
       } else if ((now - combo_start) >= EXIT_HOLD_MS) {
         break; // tenuta lunga -> esci dal menu
       }
+    } else if (combo_holding) {
+      // rilasciato prima della soglia di uscita -> tap veloce, prossimo parametro
+      combo_holding = false;
+      current_param = (current_param + 1) % PARAM_COUNT;
+      showCurrentParam();
+      // Blocca la lettura dei pulsanti per un po', per non confondere
+      // il rilascio sfalsato delle due dita con una nuova pressione
+      lockout_until = now + COMBO_LOCKOUT_MS;
     } else {
-      if (combo_holding) {
-        // rilasciato prima della soglia di uscita -> tap veloce, prossimo parametro
-        combo_holding = false;
-        current_param = (current_param + 1) % PARAM_COUNT;
-        showCurrentParam();
-        // Blocca la lettura dei pulsanti per un po', per non confondere
-        // il rilascio sfalsato delle due dita con una nuova pressione
-        lockout_until = now + COMBO_LOCKOUT_MS;
-      } else {
-        if (resetState && (now - lastReset) > REPEAT_MS) {
+      // --- RESET singolo, con finestra anti-combo-mancata ---
+      if (resetState) {
+        if (!reset_pending && !reset_active) {
+          reset_pending = true;
+          reset_pending_since = now;
+        } else if (reset_pending && (now - reset_pending_since) >= CHORD_WINDOW_MS) {
+          reset_pending = false;
+          reset_active = true;
+          lastReset = now;
+          applyIncrement();
+        } else if (reset_active && (now - lastReset) > REPEAT_MS) {
           lastReset = now;
           applyIncrement();
         }
-        if (inState && (now - lastIn) > REPEAT_MS) {
+      } else {
+        reset_pending = false;
+        reset_active = false;
+      }
+
+      // --- START singolo, stessa logica ---
+      if (inState) {
+        if (!in_pending && !in_active) {
+          in_pending = true;
+          in_pending_since = now;
+        } else if (in_pending && (now - in_pending_since) >= CHORD_WINDOW_MS) {
+          in_pending = false;
+          in_active = true;
+          lastIn = now;
+          applyDecrement();
+        } else if (in_active && (now - lastIn) > REPEAT_MS) {
           lastIn = now;
           applyDecrement();
         }
+      } else {
+        in_pending = false;
+        in_active = false;
       }
     }
     delay(15);
@@ -231,6 +314,7 @@ void UIManager::enterSettingsMenu(uint8_t &gainRegInOut, float &noiseHzInOut, in
   Serial.print("Guadagno: +"); Serial.print(gain_step * 3); Serial.println("dB");
   Serial.print("Soglia rumore: "); Serial.print(noiseHzInOut, 1); Serial.println(" Hz");
   Serial.print("Numero medie: "); Serial.println(numAvgInOut);
+  Serial.print("FFT size: "); Serial.print(fftSizeInOut); Serial.println(" punti");
 
   saveNoiseThresholdHz(noiseHzInOut);
   saveNumAverages(numAvgInOut);
